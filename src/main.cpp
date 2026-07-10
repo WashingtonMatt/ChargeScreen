@@ -41,7 +41,7 @@ static constexpr int PIN_TOUCH_SDA = 4;
 static constexpr int PIN_TOUCH_SCL = 5;
 static constexpr int PIN_TOUCH_INT = 0;
 static constexpr int PIN_TOUCH_RST = 1;
-static constexpr uint8_t PAGE_COUNT = 2;
+static constexpr uint8_t PAGE_COUNT = 3;
 static constexpr uint32_t CAPTURE_DURATION_MS = 5UL * 60UL * 1000UL;
 static constexpr size_t CSV_FLUSH_EVERY_ROWS = 20;
 
@@ -49,6 +49,10 @@ static constexpr uint16_t VICTRON_COMPANY_ID = 0x02E1;
 static constexpr uint8_t VICTRON_PRODUCT_ADVERTISEMENT = 0x10;
 static constexpr uint8_t VICTRON_SOLAR_CHARGER_RECORD = 0x01;
 static constexpr uint8_t VICTRON_BATTERY_MONITOR_RECORD = 0x02;
+static constexpr uint16_t RUUVI_COMPANY_ID = 0x0499;
+static constexpr uint8_t RUUVI_RAWV2_FORMAT = 0x05;
+static constexpr float OUTDOOR_TEMP_SCALE_MIN_F = 0.0f;
+static constexpr float OUTDOOR_TEMP_SCALE_MAX_F = 120.0f;
 static constexpr uint8_t DISPLAY_ROTATION = 2;
 static constexpr uint16_t COLOR_DARK_BLUE = 0x014A;
 static constexpr uint16_t COLOR_PANEL_BLUE = 0x0129;
@@ -112,13 +116,15 @@ Arduino_DataBus *bus = new Arduino_ESP32SPI(
     PIN_LCD_MOSI,
     GFX_NOT_DEFINED);
 
-Arduino_GFX *gfx = new Arduino_GC9A01(
+Arduino_GFX *output_display = new Arduino_GC9A01(
     bus,
     GFX_NOT_DEFINED,
     2,
     true,
     240,
     240);
+
+Arduino_GFX *gfx = new Arduino_Canvas(240, 240, output_display);  // Double buffer!
 
 Preferences secrets;
 WebServer settingsServer(80);
@@ -164,11 +170,22 @@ struct SolarStats {
   String error = "waiting";
 };
 
+struct RuuviStats {
+  bool valid = false;
+  float temperatureF = NAN;
+  float humidityPct = NAN;
+  float highF = NAN;  // Running high since boot. Resets on reboot.
+  float lowF = NAN;   // Running low since boot. Resets on reboot.
+  String error = "waiting";
+};
+
 BleSeen victronSeen;
 BleSeen solarSeen;
 BleSeen ecoSeen;
+BleSeen ruuviSeen;
 BatteryStats victronStats;
 SolarStats solarStats;
+RuuviStats ruuviStats;
 static bool gaugeFaceDrawn = false;
 static bool gaugeValuesDrawn = false;
 static int lastSocDisplay = -1;
@@ -190,6 +207,13 @@ static uint32_t lastVictronAdvertMs = 0;
 static uint32_t lastVictronDecodeMs = 0;
 static uint32_t lastSolarAdvertMs = 0;
 static uint32_t lastSolarDecodeMs = 0;
+static uint32_t lastRuuviAdvertMs = 0;
+static bool outdoorPageDrawn = false;
+static int lastOutdoorTempDisplay = -999;
+static String lastOutdoorHighText;
+static String lastOutdoorLowText;
+static String lastOutdoorHumidityText;
+static String lastOutdoorErrorText;
 static uint32_t lastBleWatchdogMs = 0;
 static uint32_t lastBleScanStartMs = 0;
 static uint8_t currentPage = 0;
@@ -408,6 +432,18 @@ static bool isVictronInstantReadout(const std::string &manufacturerData) {
   uint8_t advertisementType = static_cast<uint8_t>(manufacturerData[2]);
   return companyId == VICTRON_COMPANY_ID &&
          advertisementType == VICTRON_PRODUCT_ADVERTISEMENT;
+}
+
+static bool isRuuviRawV2(const std::string &manufacturerData) {
+  // RAWv2 needs at least: 2 company ID bytes + 1 format byte + 2 temp bytes + 2 humidity bytes.
+  if (manufacturerData.size() < 7) {
+    return false;
+  }
+
+  uint16_t companyId = static_cast<uint8_t>(manufacturerData[0]) |
+                       (static_cast<uint8_t>(manufacturerData[1]) << 8);
+  uint8_t dataFormat = static_cast<uint8_t>(manufacturerData[2]);
+  return companyId == RUUVI_COMPANY_ID && dataFormat == RUUVI_RAWV2_FORMAT;
 }
 
 static String normaliseAddress(const String &address) {
@@ -895,6 +931,46 @@ static bool decodeVictronSolarCharger(const std::string &manufacturerData) {
                 solarStats.pvPower,
                 solarStats.yieldTodayKwh,
                 solarStats.loadCurrent);
+  return true;
+}
+
+static bool decodeRuuviRawV2(const std::string &manufacturerData) {
+  ruuviStats.error = "";
+
+  const uint8_t *data = reinterpret_cast<const uint8_t *>(manufacturerData.data());
+
+  int16_t rawTemp = static_cast<int16_t>((static_cast<uint16_t>(data[3]) << 8) | data[4]);
+  uint16_t rawHumidity = (static_cast<uint16_t>(data[5]) << 8) | data[6];
+
+  // 0x8000 / 0xFFFF are Ruuvi's "sensor not available" markers.
+  if (rawTemp == static_cast<int16_t>(0x8000) || rawHumidity == 0xFFFF) {
+    ruuviStats.valid = false;
+    ruuviStats.error = "invalid reading";
+    return false;
+  }
+
+  float tempC = rawTemp * 0.005f;
+  float tempF = tempC * 9.0f / 5.0f + 32.0f;
+  float humidityPct = rawHumidity * 0.0025f;
+
+  ruuviStats.temperatureF = tempF;
+  ruuviStats.humidityPct = humidityPct;
+  ruuviStats.valid = true;
+
+  // Running high/low since boot (reset on power cycle, not a true sliding 24h window).
+  if (isnan(ruuviStats.highF) || tempF > ruuviStats.highF) {
+    ruuviStats.highF = tempF;
+  }
+  if (isnan(ruuviStats.lowF) || tempF < ruuviStats.lowF) {
+    ruuviStats.lowF = tempF;
+  }
+
+  Serial.printf("Ruuvi decoded T=%.1fF (%.1fC) RH=%.1f%% hi=%.1fF lo=%.1fF\n",
+                tempF,
+                tempC,
+                humidityPct,
+                ruuviStats.highF,
+                ruuviStats.lowF);
   return true;
 }
 
@@ -1551,6 +1627,22 @@ class ScanCallbacks : public NimBLEScanCallbacks {
                         decoded ? "decoded" : solarStats.error.c_str(),
                         bytesToHex(manufacturerData).c_str());
         }
+      } else if (isRuuviRawV2(manufacturerData)) {
+        // Ruuvi tags don't need pairing/address config - RAWv2 format is distinctive
+        // enough that we just latch onto the first one heard, same simplicity as the
+        // Victron address matching above (which also accepts whatever it hears).
+        ruuviSeen.name = name.length() ? name : "Ruuvi";
+        ruuviSeen.address = address;
+        ruuviSeen.rssi = rssi;
+        ruuviSeen.seenMs = millis();
+        lastRuuviAdvertMs = ruuviSeen.seenMs;
+        bool decoded = decodeRuuviRawV2(manufacturerData);
+
+        Serial.printf("Ruuvi %s RSSI %d %s data %s\n",
+                      address.c_str(),
+                      rssi,
+                      decoded ? "decoded" : ruuviStats.error.c_str(),
+                      bytesToHex(manufacturerData).c_str());
       }
     }
 
@@ -2396,6 +2488,7 @@ static void drawSettingsPage(bool force = false) {
 
   drawBackButton();
   settingsPageDrawn = true;
+  gfx->flush();  // Push canvas to screen
 }
 
 static uint8_t displayRotationForDegrees(int degrees) {
@@ -2419,7 +2512,11 @@ static void setScreenRotationDegrees(int degrees) {
   uint8_t nextRotation = displayRotationForDegrees(screenRotationDegrees);
   if (nextRotation != currentDisplayRotation) {
     currentDisplayRotation = nextRotation;
-    gfx->setRotation(currentDisplayRotation);
+
+    // Only the physical panel rotates; Canvas::flush() blits unrotated, so the
+    // canvas itself must stay at rotation 0 (see setup()).
+    output_display->setRotation(currentDisplayRotation);
+
     invalidateScreens();
   }
 
@@ -2447,6 +2544,7 @@ static void drawRotationSettingsPage(bool force = false) {
 
   drawBackButton();
   settingsPageDrawn = true;
+  gfx->flush();  // Push canvas to screen
 }
 
 static String savedStatus(bool saved) {
@@ -2483,6 +2581,7 @@ static void drawSettingsInfoPage(bool force = false) {
 
   drawBackButton();
   settingsPageDrawn = true;
+  gfx->flush();  // Push canvas to screen
 }
 
 static void drawGaugeFace() {
@@ -2494,6 +2593,7 @@ static void drawGaugeFace() {
   gfx->fillCircle(120, 120, GAUGE_CLEAR_RADIUS, COLOR_PANEL_BLUE);
   gaugeFaceDrawn = true;
   gaugeValuesDrawn = false;
+  gfx->flush();  // Push canvas to screen
 }
 
 static void drawBatteryValueGridAt(int16_t centerX) {
@@ -2637,6 +2737,87 @@ static void drawPageTwo(bool force = false) {
   drawSettingsButton(COLOR_SOLAR_PANEL, COLOR_SOLAR_TEXT);
   pageTwoDrawn = true;
   solarValuesDrawn = true;
+  gfx->flush();  // Push canvas to screen
+}
+
+static uint16_t colorForOutdoorTempF(float tempF) {
+  // Pure blue (cold) -> pure red (hot), linear over the configured scale. RGB565.
+  float t = constrain(tempF, OUTDOOR_TEMP_SCALE_MIN_F, OUTDOOR_TEMP_SCALE_MAX_F) /
+            (OUTDOOR_TEMP_SCALE_MAX_F - OUTDOOR_TEMP_SCALE_MIN_F);
+  uint8_t r = static_cast<uint8_t>(t * 31.0f + 0.5f);
+  uint8_t b = static_cast<uint8_t>((1.0f - t) * 31.0f + 0.5f);
+  return (static_cast<uint16_t>(r) << 11) | b;
+}
+
+static void drawOutdoorPage(bool force = false) {
+  RuuviStats stats = ruuviStats;
+  bool haveReading = stats.valid && !isnan(stats.temperatureF);
+
+  int tempDisplay = haveReading ? static_cast<int>(round(stats.temperatureF)) : -999;
+  String highText = (haveReading && !isnan(stats.highF))
+                         ? (String(static_cast<int>(round(stats.highF))) + "F")
+                         : "--F";
+  String lowText = (haveReading && !isnan(stats.lowF))
+                        ? (String(static_cast<int>(round(stats.lowF))) + "F")
+                        : "--F";
+  String humidityText = haveReading ? (String(static_cast<int>(round(stats.humidityPct))) + "%") : "--%";
+  String errorText = haveReading
+                          ? ""
+                          : (lastRuuviAdvertMs == 0
+                                 ? "waiting for sensor"
+                                 : (ruuviStats.error.length() ? ruuviStats.error : "no Ruuvi BLE"));
+
+  bool changed = force || !outdoorPageDrawn ||
+                 tempDisplay != lastOutdoorTempDisplay ||
+                 highText != lastOutdoorHighText ||
+                 lowText != lastOutdoorLowText ||
+                 humidityText != lastOutdoorHumidityText ||
+                 errorText != lastOutdoorErrorText;
+  if (!changed) {
+    return;
+  }
+
+  gfx->fillScreen(COLOR_BLACK_SOFT);
+
+  uint16_t ringColor = haveReading ? colorForOutdoorTempF(stats.temperatureF) : COLOR_RING_TRACK;
+  float sweep = haveReading
+                    ? GAUGE_ARC_SWEEP_DEG *
+                          (constrain(stats.temperatureF, OUTDOOR_TEMP_SCALE_MIN_F, OUTDOOR_TEMP_SCALE_MAX_F) /
+                           (OUTDOOR_TEMP_SCALE_MAX_F - OUTDOOR_TEMP_SCALE_MIN_F))
+                    : 0.0f;
+  drawSegmentedGaugeArc(sweep, COLOR_RING_TRACK, ringColor);
+  gfx->fillCircle(120, 120, GAUGE_CLEAR_RADIUS, COLOR_PANEL_BLUE);
+
+  if (haveReading) {
+    if (showValueLabels) {
+      drawTinyLabel("OUTDOOR TEMP", 120, 42, COLOR_DIM_TEXT);
+    }
+    drawAaCentered(AA_FONT_LARGE, String(tempDisplay) + "F", 120, 47, WHITE);
+    drawAaCentered(AA_FONT_SMALL, highText, 78, 104, WHITE);
+    drawAaCentered(AA_FONT_SMALL, lowText, 164, 104, WHITE);
+    if (showValueLabels) {
+      drawTinyLabel("HIGH", 78, 130, COLOR_DIM_TEXT);
+      drawTinyLabel("LOW", 164, 130, COLOR_DIM_TEXT);
+    }
+    drawAaCentered(AA_FONT_SMALL, humidityText, 120, 147, WHITE);
+    if (showValueLabels) {
+      drawTinyLabel("HUMIDITY", 120, 173, COLOR_DIM_TEXT);
+    }
+    drawAaCentered(AA_FONT_SMALL, "since power on", 120, 185, COLOR_DIM_TEXT);
+  } else {
+    drawAaCentered(AA_FONT_LARGE, "--F", 120, 50, WHITE);
+    drawAaCentered(AA_FONT_SMALL, errorText, 120, 106, COLOR_DIM_TEXT);
+    drawDeviceLine(135, "Ruuvi", ruuviSeen);
+  }
+
+  lastOutdoorTempDisplay = tempDisplay;
+  lastOutdoorHighText = highText;
+  lastOutdoorLowText = lowText;
+  lastOutdoorHumidityText = humidityText;
+  lastOutdoorErrorText = errorText;
+  drawSettingsButton(COLOR_PANEL_BLUE, WHITE);
+  outdoorPageDrawn = true;
+  gfx->flush();  // Push canvas to screen
 }
 
 static void drawCaptureSecondRing(uint32_t remainingSeconds) {
@@ -2728,6 +2909,7 @@ static void drawCapturePage(bool force = false) {
   lastCaptureRssiText = captureStrongestRssi > -127 ? String(captureStrongestRssi) + "dBm" : "-";
   lastCaptureButtonText = captureActive ? "Stop" : (captureSaved ? "Done" : "");
   capturePageDrawn = true;
+  gfx->flush();  // Push canvas to screen
 }
 
 static void drawCurrentPage(bool force) {
@@ -2760,8 +2942,10 @@ static void drawCurrentPage(bool force) {
       drawGaugeFace();
     }
     drawGaugeValues(force);
-  } else {
+  } else if (currentPage == 1) {
     drawPageTwo(force);
+  } else {
+    drawOutdoorPage(force);
   }
 }
 
@@ -2780,6 +2964,7 @@ static void switchPage(uint8_t page, int8_t direction = 1) {
   solarValuesDrawn = false;
   gaugeFaceDrawn = false;
   capturePageDrawn = false;
+  outdoorPageDrawn = false;
   drawCurrentPage(true);
 }
 
@@ -2787,6 +2972,15 @@ static void togglePageFromSwipe(int8_t direction) {
   uint8_t nextPage = direction >= 0
                          ? (currentPage + 1) % PAGE_COUNT
                          : (currentPage + PAGE_COUNT - 1) % PAGE_COUNT;
+
+  // The outdoor page only joins the rotation once a Ruuvi tag has actually
+  // been heard - no point swiping to a page that can only ever say "waiting".
+  if (nextPage == 2 && lastRuuviAdvertMs == 0) {
+    nextPage = direction >= 0
+                   ? (nextPage + 1) % PAGE_COUNT
+                   : (nextPage + PAGE_COUNT - 1) % PAGE_COUNT;
+  }
+
   switchPage(nextPage, direction);
 }
 
@@ -3141,6 +3335,7 @@ static void drawGaugeValues(bool force = false) {
   lastErrorText = errorText;
   drawSettingsButton(COLOR_PANEL_BLUE, WHITE);
   gaugeValuesDrawn = true;
+  gfx->flush();  // Push canvas to screen
 }
 
 static void updateBleWatchdog() {
@@ -3332,11 +3527,18 @@ void setup() {
   initBacklight();
   noteTouchActivity();
 
-  if (!gfx->begin(80000000)) {
+  if (!output_display->begin(80000000)) {
     Serial.println("Display init failed");
   }
+  if (!gfx->begin()) {
+    Serial.println("Canvas init failed");
+  }
 
-  gfx->setRotation(currentDisplayRotation);
+  // Only the physical panel rotates. Arduino_Canvas::flush() blits its framebuffer
+  // to output_display unrotated, so rotating the Canvas itself would double-apply
+  // the rotation. Keep the canvas at 0 and let output_display's MADCTL do the work.
+  gfx->setRotation(0);
+  output_display->setRotation(currentDisplayRotation);
   initTouch();
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS init failed");
