@@ -237,6 +237,7 @@ static uint32_t lastSettingsServerActivityMs = 0;
 static String storedVictronKey;
 static String storedSolarKey;
 static String storedEcoWorthyPassword;
+static String storedRuuviMac;  // normalised (lowercase, no separators) MAC of the paired Ruuvi tag, or "" if unpaired
 static bool demoModeEnabled = DEMO_MODE;
 static bool ecoWorthyBatteryMode = false;
 static bool showValueLabels = true;
@@ -466,6 +467,31 @@ static bool matchesConfiguredSolarAddress(const String &address) {
   return true;
 }
 
+static bool matchesConfiguredRuuviAddress(const String &address) {
+  if (!storedRuuviMac.length()) {
+    // Unpaired: preserve the original "accept whatever Ruuvi tag is heard
+    // first" behaviour so firmware upgrades don't silently stop reporting
+    // outdoor data until the user visits Settings and pairs a tag.
+    return true;
+  }
+  return normaliseAddress(address) == storedRuuviMac;
+}
+
+static String formatMacColon(const String &normalisedMac) {
+  if (normalisedMac.length() != 12) {
+    return normalisedMac;
+  }
+  String out;
+  out.reserve(17);
+  for (size_t i = 0; i < 12; i += 2) {
+    if (i) {
+      out += ':';
+    }
+    out += normalisedMac.substring(i, i + 2);
+  }
+  return out;
+}
+
 static bool hexToBytes(const char *hex, uint8_t *out, size_t outLen) {
   if (strlen(hex) != outLen * 2) {
     return false;
@@ -607,6 +633,7 @@ static void loadStoredSecrets() {
   storedVictronKey = secrets.getString("shunt_key", "");
   storedSolarKey = secrets.getString("solar_key", "");
   storedEcoWorthyPassword = secrets.getString("eco_key", "");
+  storedRuuviMac = secrets.getString("ruuvi_mac", "");
   demoModeEnabled = secrets.getBool("demo_mode", DEMO_MODE);
   ecoWorthyBatteryMode = secrets.getBool("battery_eco", false);
   showValueLabels = secrets.getBool("value_labels", true);
@@ -1628,21 +1655,23 @@ class ScanCallbacks : public NimBLEScanCallbacks {
                         bytesToHex(manufacturerData).c_str());
         }
       } else if (isRuuviRawV2(manufacturerData)) {
-        // Ruuvi tags don't need pairing/address config - RAWv2 format is distinctive
-        // enough that we just latch onto the first one heard, same simplicity as the
-        // Victron address matching above (which also accepts whatever it hears).
-        ruuviSeen.name = name.length() ? name : "Ruuvi";
-        ruuviSeen.address = address;
-        ruuviSeen.rssi = rssi;
-        ruuviSeen.seenMs = millis();
-        lastRuuviAdvertMs = ruuviSeen.seenMs;
-        bool decoded = decodeRuuviRawV2(manufacturerData);
+        // If a MAC has been paired via Settings, only accept advertisements
+        // from that tag - otherwise fall back to the original "first Ruuvi
+        // heard" behaviour so unpaired/upgraded firmware keeps working.
+        if (matchesConfiguredRuuviAddress(address)) {
+          ruuviSeen.name = name.length() ? name : "Ruuvi";
+          ruuviSeen.address = address;
+          ruuviSeen.rssi = rssi;
+          ruuviSeen.seenMs = millis();
+          lastRuuviAdvertMs = ruuviSeen.seenMs;
+          bool decoded = decodeRuuviRawV2(manufacturerData);
 
-        Serial.printf("Ruuvi %s RSSI %d %s data %s\n",
-                      address.c_str(),
-                      rssi,
-                      decoded ? "decoded" : ruuviStats.error.c_str(),
-                      bytesToHex(manufacturerData).c_str());
+          Serial.printf("Ruuvi %s RSSI %d %s data %s\n",
+                        address.c_str(),
+                        rssi,
+                        decoded ? "decoded" : ruuviStats.error.c_str(),
+                        bytesToHex(manufacturerData).c_str());
+        }
       }
     }
 
@@ -1796,6 +1825,12 @@ static String settingsStatusMessage(const String &code) {
   if (code == "capture-cancelled") {
     return "BLE capture cancelled. No CSV was saved.";
   }
+  if (code == "ruuvi-paired") {
+    return "Ruuvi tag paired. Outdoor page will only use that tag from now on.";
+  }
+  if (code == "ruuvi-unpaired") {
+    return "Ruuvi unpaired. Outdoor page will show the first Ruuvi tag heard again.";
+  }
   return "";
 }
 
@@ -1827,7 +1862,7 @@ static bool looksLikeEsp32FirmwareChunk(const uint8_t *data, size_t len) {
 
 static String settingsPageHtml(const String &message = "") {
   String html;
-  html.reserve(11000);
+  html.reserve(14000);
   html += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<meta http-equiv='Cache-Control' content='no-store'>");
   html += F("<title>ChargeScreen Setup</title><style>");
@@ -1876,6 +1911,23 @@ static String settingsPageHtml(const String &message = "") {
   html += F(">Victron</option><option value='eco'");
   html += ecoWorthyBatteryMode ? F(" selected") : F("");
   html += F(">Eco-Worthy</option></select>");
+  html += F("<h2>Ruuvi Outdoor Sensor</h2>");
+  html += F("<p class='hint'>Pair ChargeScreen to one specific Ruuvi tag by MAC address, so it ignores any other Ruuvi tags nearby - for example a neighbour's tag in an RV park. Open the Ruuvi Station app, tap your tag, and copy its MAC address in below.</p>");
+  if (storedRuuviMac.length()) {
+    html += F("<p class='hint'>Currently paired: <strong>");
+    html += formatMacColon(storedRuuviMac);
+    html += F("</strong></p>");
+  } else {
+    html += F("<p class='hint'>Not paired yet. The outdoor page currently shows the first Ruuvi tag heard, same as before.</p>");
+  }
+  html += F("<form method='post' action='/pair-ruuvi' data-working='Pairing...'>");
+  html += F("<label for='ruuvi_mac'>Ruuvi MAC address</label><input id='ruuvi_mac' name='ruuvi_mac' type='text' placeholder='aa:bb:cc:dd:ee:ff' pattern='[0-9a-fA-F:]{12,17}' maxlength='17' value='");
+  html += formatMacColon(storedRuuviMac);
+  html += F("'>");
+  html += F("<button type='submit'>Pair Tag</button></form>");
+  if (storedRuuviMac.length()) {
+    html += F("<form method='post' action='/unpair-ruuvi' data-working='Unpairing...'><button class='danger' type='submit'>Unpair Ruuvi Tag</button></form>");
+  }
   html += F("<h2>Settings</h2>");
   html += F("<label for='solar_watts'>Solar panel watts</label><input id='solar_watts' name='solar_watts' type='number' min='");
   html += MIN_SOLAR_ARRAY_WATTS;
@@ -2355,6 +2407,39 @@ static void handleCaptureCancel() {
   drawCurrentPage(true);
 }
 
+static void resetRuuviReadings() {
+  ruuviSeen = BleSeen();
+  ruuviStats = RuuviStats();
+  lastRuuviAdvertMs = 0;
+  outdoorPageDrawn = false;
+}
+
+static void handlePairRuuvi() {
+  noteSettingsServerActivity();
+  String mac = normaliseAddress(settingsServer.arg("ruuvi_mac"));
+  if (mac.length() == 12) {
+    storedRuuviMac = mac;
+    secrets.putString("ruuvi_mac", storedRuuviMac);
+    resetRuuviReadings();
+    settingsMessage = String("Paired to ") + formatMacColon(storedRuuviMac);
+    redirectToSettingsPage("ruuvi-paired");
+  } else {
+    settingsMessage = "Enter a full 6-byte MAC address, e.g. aa:bb:cc:dd:ee:ff";
+    redirectToSettingsPage("invalid");
+  }
+  drawCurrentPage(true);
+}
+
+static void handleUnpairRuuvi() {
+  noteSettingsServerActivity();
+  storedRuuviMac = "";
+  secrets.remove("ruuvi_mac");
+  resetRuuviReadings();
+  settingsMessage = "Ruuvi unpaired";
+  redirectToSettingsPage("ruuvi-unpaired");
+  drawCurrentPage(true);
+}
+
 static void startSettingsServer() {
   if (settingsServerActive) {
     noteSettingsServerActivity();
@@ -2383,6 +2468,8 @@ static void startSettingsServer() {
   settingsServer.on("/capture-start", HTTP_POST, handleCaptureStart);
   settingsServer.on("/capture-stop", HTTP_POST, handleCaptureStop);
   settingsServer.on("/capture-cancel", HTTP_POST, handleCaptureCancel);
+  settingsServer.on("/pair-ruuvi", HTTP_POST, handlePairRuuvi);
+  settingsServer.on("/unpair-ruuvi", HTTP_POST, handleUnpairRuuvi);
   settingsServer.onNotFound(handleSettingsRoot);
   captiveDnsServer.start(53, "*", WiFi.softAPIP());
   settingsServer.begin();
