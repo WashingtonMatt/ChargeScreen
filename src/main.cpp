@@ -8,6 +8,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <esp_task_wdt.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/sha256.h>
 #include <math.h>
@@ -212,6 +213,7 @@ static String lastCaptureButtonText;
 static bool settingsPageDrawn = false;
 static bool settingsServerActive = false;
 static uint32_t lastSettingsServerActivityMs = 0;
+static uint32_t lastSettingsServerStopMs = 0;
 static String storedVictronKey;
 static String storedSolarKey;
 static String storedEcoWorthyPassword;
@@ -1735,162 +1737,203 @@ static bool looksLikeEsp32FirmwareChunk(const uint8_t *data, size_t len) {
          (chipId == 0 || chipId == 5);
 }
 
-static String settingsPageHtml(const String &message = "") {
-  String html;
-  html.reserve(11000);
-  html += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
-  html += F("<meta http-equiv='Cache-Control' content='no-store'>");
-  html += F("<title>ChargeScreen Setup</title><style>");
-  html += F("body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#07151c;color:#eef;padding:22px}");
-  html += F("main{max-width:560px;margin:auto}h1{text-align:center;margin:8px 0 4px}h2{margin-top:28px;border-top:1px solid #274653;padding-top:18px}label{display:block;margin:18px 0 6px;color:#b8cad2}");
-  html += F("input,select{box-sizing:border-box;width:100%;padding:13px;border:1px solid #42616d;background:#102832;color:#fff;font-size:16px}");
-  html += F("input[type=checkbox]{width:auto;margin-right:8px}.check{display:flex;align-items:center;margin-top:14px;color:#eef}.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}");
-  html += F("button{margin-top:18px;width:100%;padding:14px;border:0;background:#2fb36d;color:#04140b;font-weight:700;font-size:16px}");
-  html += F("button.secondary{background:#183743;color:#eef;border:1px solid #42616d}");
-  html += F("button.danger{background:#56302f;color:#fff;border:1px solid #a85c58}");
-  html += F("button:disabled{opacity:.65}.msg{padding:12px;background:#123345;margin:12px 0}");
-  html += F(".hint,.version{color:#b8cad2;font-size:14px;line-height:1.45}.version{margin-top:22px;text-align:center}.split{display:grid;gap:10px;margin-top:8px}</style></head><body><main>");
-  html += F("<h1>ChargeScreen</h1>");
-  html += F("<p class='version'><a href='mailto:contact@chargescreen.co.uk' style='color:#8fe6ff'>contact@chargescreen.co.uk</a></p>");
-  html += F("<p class='version'>");
-  html += FIRMWARE_VERSION;
-  html += F("</p>");
-  if (message.length()) {
-    html += F("<div class='msg' id='status'>");
-    html += message;
-    html += F("</div>");
-  } else {
-    html += F("<div class='msg' id='status' hidden></div>");
+// NOTE: this used to build the whole page as one large String (with a
+// reserve(11000) up front) and send it in a single response. That requires
+// one big *contiguous* heap block. Once the offscreen canvas + WiFi AP +
+// BLE scan are all running at once, free heap gets fragmented enough that a
+// single ~11KB contiguous block often isn't available, and the allocation
+// silently struggles/fails right as a client requests this page - which
+// matched the settings-portal-unresponsive symptom exactly.
+//
+// Fix: stream the page to the client in small pieces via sendContent().
+// Each piece is a handful of bytes (a String literal or a tiny number-to-
+// string conversion), so it never needs a large contiguous block, and it
+// doesn't matter how fragmented the heap gets.
+// Batches small pieces of the settings page into a ~1KB buffer before
+// actually writing to the network. Sending 130 individual tiny writes
+// (the first streaming attempt) was slow enough over WiFi (each write has
+// its own TCP+chunk-encoding overhead, and Nagle's algorithm adds delay
+// between small successive writes) that the browser was resetting the
+// connection mid-page-load. A single ~11KB buffer (the original version)
+// was fast but needed one large contiguous heap allocation, which failed
+// under fragmentation. ~1KB is small enough to always allocate easily,
+// while cutting total network writes for the whole page down to roughly
+// 10 instead of 130.
+static String settingsChunkBuffer;
+static constexpr size_t SETTINGS_CHUNK_TARGET_BYTES = 1024;
+
+static void settingsChunkReset() {
+  settingsChunkBuffer = "";
+  settingsChunkBuffer.reserve(SETTINGS_CHUNK_TARGET_BYTES + 256);
+}
+
+static void settingsChunkFlush() {
+  if (settingsChunkBuffer.length()) {
+    settingsServer.sendContent(settingsChunkBuffer);
+    settingsChunkBuffer = "";
   }
-  html += F("<h2>Using ChargeScreen</h2>");
-  html += F("<p class='hint'>Power ChargeScreen using USB-C or the rear connector. If using the rear connector, plug it in carefully with the <strong>red wire closest to the USB-C port</strong>. Follow the connector position, not the cable colours: voltage and ground use the opposite colours to the usual convention.</p>");
-  html += F("<p class='hint'>Open Settings from the cog on the round display, start WiFi, join the ChargeScreen hotspot, and use this page to enter keys and configure the display.</p>");
-  html += F("<form method='post' action='/save' data-working='Saving...'>");
-  html += F("<h2>Victron</h2>");
-  html += F("<p class='hint'>For a Victron Shunt or Victron MPPT solar controller, open VictronConnect, connect to the device, open Settings, tap the three dots, then open Product info. Enable Instant Readout if needed, show the Instant Readout encryption data, and paste the 32 character encryption key below. A MAC address is not required. Saved keys stay on this device.</p>");
-  html += F("<label for='shunt_key'>Battery monitor key</label><input id='shunt_key' name='shunt_key' autocomplete='off' placeholder='");
-  html += maskedKeyText(storedVictronKey);
-  html += F("'>");
-  html += F("<label for='solar_key'>Solar controller key</label><input id='solar_key' name='solar_key' autocomplete='off' placeholder='");
-  html += maskedKeyText(storedSolarKey);
-  html += F("'>");
-  html += F("<h2>Eco-Worthy</h2>");
-  html += F("<p class='hint'>Eco-Worthy/JBD support is not working yet. These settings are here for testing future compatibility. Batteries commonly use password 123123.</p>");
-  html += F("<label for='eco_key'>Eco-Worthy/JBD battery password</label><input id='eco_key' name='eco_key' autocomplete='off' placeholder='");
-  html += maskedPasswordText(storedEcoWorthyPassword);
-  html += F("'>");
-  html += F("<h2>Sources</h2>");
-  html += F("<label for='solar_source'>Solar</label><select id='solar_source' name='solar_source'><option value='victron' selected>Victron</option><option value='other' disabled>Other - not implemented</option></select>");
-  html += F("<label for='battery_mode'>Battery source</label><select id='battery_mode' name='battery_mode'><option value='victron'");
-  html += !ecoWorthyBatteryMode ? F(" selected") : F("");
-  html += F(">Victron</option><option value='eco'");
-  html += ecoWorthyBatteryMode ? F(" selected") : F("");
-  html += F(">Eco-Worthy</option></select>");
-  html += F("<h2>Settings</h2>");
-  html += F("<label for='solar_watts'>Solar panel watts</label><input id='solar_watts' name='solar_watts' type='number' min='");
-  html += MIN_SOLAR_ARRAY_WATTS;
-  html += F("' max='");
-  html += MAX_SOLAR_ARRAY_WATTS;
-  html += F("' step='");
-  html += SOLAR_ARRAY_WATTS_STEP;
-  html += F("' value='");
-  html += solarArrayWatts;
-  html += F("'>");
-  html += F("<label for='screen_timeout'>Screen off delay</label><select id='screen_timeout' name='screen_timeout'>");
-  html += F("<option value='10'");
-  html += screenTimeoutSeconds == 10 ? F(" selected") : F("");
-  html += F(">10 seconds</option><option value='30'");
-  html += screenTimeoutSeconds == 30 ? F(" selected") : F("");
-  html += F(">30 seconds</option><option value='60'");
-  html += screenTimeoutSeconds == 60 ? F(" selected") : F("");
-  html += F(">60 seconds</option><option value='0'");
-  html += screenTimeoutSeconds == SCREEN_TIMEOUT_NEVER ? F(" selected") : F("");
-  html += F(">0</option></select>");
-  html += F("<label for='screen_rotation'>Screen rotation</label><select id='screen_rotation' name='screen_rotation'>");
+}
+
+static void settingsChunkAppend(const String &piece) {
+  if (settingsChunkBuffer.length() + piece.length() > SETTINGS_CHUNK_TARGET_BYTES) {
+    settingsChunkFlush();
+  }
+  settingsChunkBuffer += piece;
+}
+
+static void streamSettingsPageHtml(const String &message) {
+  settingsChunkAppend(F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"));
+  settingsChunkAppend(F("<meta http-equiv='Cache-Control' content='no-store'>"));
+  settingsChunkAppend(F("<title>ChargeScreen Setup</title><style>"));
+  settingsChunkAppend(F("body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#07151c;color:#eef;padding:22px}"));
+  settingsChunkAppend(F("main{max-width:560px;margin:auto}h1{text-align:center;margin:8px 0 4px}h2{margin-top:28px;border-top:1px solid #274653;padding-top:18px}label{display:block;margin:18px 0 6px;color:#b8cad2}"));
+  settingsChunkAppend(F("input,select{box-sizing:border-box;width:100%;padding:13px;border:1px solid #42616d;background:#102832;color:#fff;font-size:16px}"));
+  settingsChunkAppend(F("input[type=checkbox]{width:auto;margin-right:8px}.check{display:flex;align-items:center;margin-top:14px;color:#eef}.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}"));
+  settingsChunkAppend(F("button{margin-top:18px;width:100%;padding:14px;border:0;background:#2fb36d;color:#04140b;font-weight:700;font-size:16px}"));
+  settingsChunkAppend(F("button.secondary{background:#183743;color:#eef;border:1px solid #42616d}"));
+  settingsChunkAppend(F("button.danger{background:#56302f;color:#fff;border:1px solid #a85c58}"));
+  settingsChunkAppend(F("button:disabled{opacity:.65}.msg{padding:12px;background:#123345;margin:12px 0}"));
+  settingsChunkAppend(F(".hint,.version{color:#b8cad2;font-size:14px;line-height:1.45}.version{margin-top:22px;text-align:center}.split{display:grid;gap:10px;margin-top:8px}</style></head><body><main>"));
+  settingsChunkAppend(F("<h1>ChargeScreen</h1>"));
+  settingsChunkAppend(F("<p class='version'><a href='mailto:contact@chargescreen.co.uk' style='color:#8fe6ff'>contact@chargescreen.co.uk</a></p>"));
+  settingsChunkAppend(F("<p class='version'>"));
+  settingsChunkAppend(FIRMWARE_VERSION);
+  settingsChunkAppend(F("</p>"));
+  if (message.length()) {
+    settingsChunkAppend(F("<div class='msg' id='status'>"));
+    settingsChunkAppend(message);
+    settingsChunkAppend(F("</div>"));
+  } else {
+    settingsChunkAppend(F("<div class='msg' id='status' hidden></div>"));
+  }
+  settingsChunkAppend(F("<h2>Using ChargeScreen</h2>"));
+  settingsChunkAppend(F("<p class='hint'>Power ChargeScreen using USB-C or the rear connector. If using the rear connector, plug it in carefully with the <strong>red wire closest to the USB-C port</strong>. Follow the connector position, not the cable colours: voltage and ground use the opposite colours to the usual convention.</p>"));
+  settingsChunkAppend(F("<p class='hint'>Open Settings from the cog on the round display, start WiFi, join the ChargeScreen hotspot, and use this page to enter keys and configure the display.</p>"));
+  settingsChunkAppend(F("<form method='post' action='/save' data-working='Saving...'>"));
+  settingsChunkAppend(F("<h2>Victron</h2>"));
+  settingsChunkAppend(F("<p class='hint'>For a Victron Shunt or Victron MPPT solar controller, open VictronConnect, connect to the device, open Settings, tap the three dots, then open Product info. Enable Instant Readout if needed, show the Instant Readout encryption data, and paste the 32 character encryption key below. A MAC address is not required. Saved keys stay on this device.</p>"));
+  settingsChunkAppend(F("<label for='shunt_key'>Battery monitor key</label><input id='shunt_key' name='shunt_key' autocomplete='off' placeholder='"));
+  settingsChunkAppend(maskedKeyText(storedVictronKey));
+  settingsChunkAppend(F("'>"));
+  settingsChunkAppend(F("<label for='solar_key'>Solar controller key</label><input id='solar_key' name='solar_key' autocomplete='off' placeholder='"));
+  settingsChunkAppend(maskedKeyText(storedSolarKey));
+  settingsChunkAppend(F("'>"));
+  settingsChunkAppend(F("<h2>Eco-Worthy</h2>"));
+  settingsChunkAppend(F("<p class='hint'>Eco-Worthy/JBD support is not working yet. These settings are here for testing future compatibility. Batteries commonly use password 123123.</p>"));
+  settingsChunkAppend(F("<label for='eco_key'>Eco-Worthy/JBD battery password</label><input id='eco_key' name='eco_key' autocomplete='off' placeholder='"));
+  settingsChunkAppend(maskedPasswordText(storedEcoWorthyPassword));
+  settingsChunkAppend(F("'>"));
+  settingsChunkAppend(F("<h2>Sources</h2>"));
+  settingsChunkAppend(F("<label for='solar_source'>Solar</label><select id='solar_source' name='solar_source'><option value='victron' selected>Victron</option><option value='other' disabled>Other - not implemented</option></select>"));
+  settingsChunkAppend(F("<label for='battery_mode'>Battery source</label><select id='battery_mode' name='battery_mode'><option value='victron'"));
+  settingsChunkAppend(!ecoWorthyBatteryMode ? F(" selected") : F(""));
+  settingsChunkAppend(F(">Victron</option><option value='eco'"));
+  settingsChunkAppend(ecoWorthyBatteryMode ? F(" selected") : F(""));
+  settingsChunkAppend(F(">Eco-Worthy</option></select>"));
+  settingsChunkAppend(F("<h2>Settings</h2>"));
+  settingsChunkAppend(F("<label for='solar_watts'>Solar panel watts</label><input id='solar_watts' name='solar_watts' type='number' min='"));
+  settingsChunkAppend(String(MIN_SOLAR_ARRAY_WATTS));
+  settingsChunkAppend(F("' max='"));
+  settingsChunkAppend(String(MAX_SOLAR_ARRAY_WATTS));
+  settingsChunkAppend(F("' step='"));
+  settingsChunkAppend(String(SOLAR_ARRAY_WATTS_STEP));
+  settingsChunkAppend(F("' value='"));
+  settingsChunkAppend(String(solarArrayWatts));
+  settingsChunkAppend(F("'>"));
+  settingsChunkAppend(F("<label for='screen_timeout'>Screen off delay</label><select id='screen_timeout' name='screen_timeout'>"));
+  settingsChunkAppend(F("<option value='10'"));
+  settingsChunkAppend(screenTimeoutSeconds == 10 ? F(" selected") : F(""));
+  settingsChunkAppend(F(">10 seconds</option><option value='30'"));
+  settingsChunkAppend(screenTimeoutSeconds == 30 ? F(" selected") : F(""));
+  settingsChunkAppend(F(">30 seconds</option><option value='60'"));
+  settingsChunkAppend(screenTimeoutSeconds == 60 ? F(" selected") : F(""));
+  settingsChunkAppend(F(">60 seconds</option><option value='0'"));
+  settingsChunkAppend(screenTimeoutSeconds == SCREEN_TIMEOUT_NEVER ? F(" selected") : F(""));
+  settingsChunkAppend(F(">0</option></select>"));
+  settingsChunkAppend(F("<label for='screen_rotation'>Screen rotation</label><select id='screen_rotation' name='screen_rotation'>"));
   const int rotationOptions[] = {0, 90, 180, 270};
   for (int degrees : rotationOptions) {
-    html += F("<option value='");
-    html += degrees;
-    html += F("'");
-    html += screenRotationDegrees == degrees ? F(" selected") : F("");
-    html += F(">");
-    html += degrees;
-    html += F("</option>");
+    settingsChunkAppend(F("<option value='"));
+    settingsChunkAppend(String(degrees));
+    settingsChunkAppend(F("'"));
+    settingsChunkAppend(screenRotationDegrees == degrees ? F(" selected") : F(""));
+    settingsChunkAppend(F(">"));
+    settingsChunkAppend(String(degrees));
+    settingsChunkAppend(F("</option>"));
   }
-  html += F("</select>");
-  html += F("<label for='dimming'>Dimming</label><select id='dimming' name='dimming'><option value='0'");
-  html += backlightLevel == BACKLIGHT_LEVEL_MAX ? F(" selected") : F("");
-  html += F(">Max</option><option value='1'");
-  html += backlightLevel == BACKLIGHT_LEVEL_MID ? F(" selected") : F("");
-  html += F(">Mid</option><option value='2'");
-  html += backlightLevel == BACKLIGHT_LEVEL_LOW ? F(" selected") : F("");
-  html += F(">Low</option></select>");
-  html += F("<label class='check'><input type='checkbox' name='labels' value='1'");
-  html += showValueLabels ? F(" checked") : F("");
-  html += F(">Show labels</label>");
-  html += F("<label class='check'><input type='checkbox' name='value_grid' value='1'");
-  html += showValueGrid ? F(" checked") : F("");
-  html += F(">Show value grid</label>");
-  html += F("<label class='check'><input type='checkbox' name='demo_mode' value='1'");
-  html += demoModeEnabled ? F(" checked") : F("");
-  html += F(">Demo mode</label>");
-  html += F("<h2>Demo Values</h2><div class='grid'>");
-  html += F("<label for='demo_soc'>Battery %</label><label for='demo_voltage'>Battery V</label>");
-  html += F("<input id='demo_soc' name='demo_soc' type='number' step='1' value='");
-  html += String(demoBatterySoc, 0);
-  html += F("'><input id='demo_voltage' name='demo_voltage' type='number' step='0.1' value='");
-  html += String(demoBatteryVoltage, 1);
-  html += F("'><label for='demo_current'>Battery A</label><label for='demo_ah'>Used Ah</label><input id='demo_current' name='demo_current' type='number' step='0.1' value='");
-  html += String(demoBatteryCurrent, 1);
-  html += F("'><input id='demo_ah' name='demo_ah' type='number' step='0.1' value='");
-  html += String(demoBatteryConsumedAh, 1);
-  html += F("'><label for='demo_pv'>Solar W</label><label for='demo_solar_v'>Solar battery V</label><input id='demo_pv' name='demo_pv' type='number' step='1' value='");
-  html += String(demoSolarPvPower, 0);
-  html += F("'><input id='demo_solar_v' name='demo_solar_v' type='number' step='0.1' value='");
-  html += String(demoSolarBatteryVoltage, 1);
-  html += F("'><label for='demo_solar_a'>Solar charge A</label><label for='demo_yield'>Solar yield kWh</label><input id='demo_solar_a' name='demo_solar_a' type='number' step='0.1' value='");
-  html += String(demoSolarChargeCurrent, 1);
-  html += F("'><input id='demo_yield' name='demo_yield' type='number' step='0.01' value='");
-  html += String(demoSolarYieldKwh, 2);
-  html += F("'></div>");
-  html += F("<button type='submit'>Save Settings</button></form>");
-  html += F("<form method='post' action='/clear-keys' data-working='Clearing keys...'>");
-  html += F("<button class='danger' type='submit'>Clear Saved Keys</button></form>");
-  html += F("<h2>Premade ChargeScreen</h2>");
-  html += F("<p class='hint'>Premade units with firmware already installed are available through the ChargeScreen project thread on the T6 Forum.</p>");
-  html += F("<a href='https://www.t6forum.com/threads/standalone-esp32-ble-battery-display-for-victron-systems.66515/' style='display:block;box-sizing:border-box;width:100%;margin-top:18px;padding:14px;background:#2fb36d;color:#04140b;text-align:center;text-decoration:none;font-weight:700'>View T6 Forum thread</a>");
-  html += F("<h2>BLE Capture</h2>");
-  html += F("<p class='hint'>This records nearby Bluetooth Low Energy advertisements for 5 minutes so the data can be inspected later. During capture, the round screen changes to a capture display and normal dashboard decoding is paused. The CSV records timing, address, name, signal strength, manufacturer data, service data, advertised UUIDs, and raw advertisement payloads.</p>");
-  html += F("<p class='hint'>Privacy note: this captures all BLE advertisements nearby, including packets from things like watches, phones, TVs, and sensors. Most of that data is encrypted or only useful to the device it belongs to, but the packets will still appear in the CSV. It is safe to share for debugging.</p>");
-  html += F("<p class='hint'>Your battery data may also be encrypted. If the battery app shows Bluetooth encryption codes, include them with the email containing the capture. Those codes only help decode the battery packets; they do not give access to your WiFi, phone, or other devices. Realistically, the most they could reveal is your battery status if someone was physically nearby, for example on the same campsite.</p>");
-  html += F("<p class='hint'>Send the completed CSV and any battery encryption codes to <a href='mailto:blecapture@chargescreen.co.uk' style='color:#8fe6ff'>blecapture@chargescreen.co.uk</a>. Captures are used to improve compatibility with more devices in future firmware.</p>");
-  html += F("<p class='hint'>Use this with the device physically close to the battery or accessory you want to identify. The saved CSV is named after the strongest BLE signal heard during the capture.</p>");
-  html += F("<div class='msg'><strong id='cap_state'>Capture status loading...</strong><br><span id='cap_detail' class='hint'></span></div>");
+  settingsChunkAppend(F("</select>"));
+  settingsChunkAppend(F("<label for='dimming'>Dimming</label><select id='dimming' name='dimming'><option value='0'"));
+  settingsChunkAppend(backlightLevel == BACKLIGHT_LEVEL_MAX ? F(" selected") : F(""));
+  settingsChunkAppend(F(">Max</option><option value='1'"));
+  settingsChunkAppend(backlightLevel == BACKLIGHT_LEVEL_MID ? F(" selected") : F(""));
+  settingsChunkAppend(F(">Mid</option><option value='2'"));
+  settingsChunkAppend(backlightLevel == BACKLIGHT_LEVEL_LOW ? F(" selected") : F(""));
+  settingsChunkAppend(F(">Low</option></select>"));
+  settingsChunkAppend(F("<label class='check'><input type='checkbox' name='labels' value='1'"));
+  settingsChunkAppend(showValueLabels ? F(" checked") : F(""));
+  settingsChunkAppend(F(">Show labels</label>"));
+  settingsChunkAppend(F("<label class='check'><input type='checkbox' name='value_grid' value='1'"));
+  settingsChunkAppend(showValueGrid ? F(" checked") : F(""));
+  settingsChunkAppend(F(">Show value grid</label>"));
+  settingsChunkAppend(F("<label class='check'><input type='checkbox' name='demo_mode' value='1'"));
+  settingsChunkAppend(demoModeEnabled ? F(" checked") : F(""));
+  settingsChunkAppend(F(">Demo mode</label>"));
+  settingsChunkAppend(F("<h2>Demo Values</h2><div class='grid'>"));
+  settingsChunkAppend(F("<label for='demo_soc'>Battery %</label><label for='demo_voltage'>Battery V</label>"));
+  settingsChunkAppend(F("<input id='demo_soc' name='demo_soc' type='number' step='1' value='"));
+  settingsChunkAppend(String(demoBatterySoc, 0));
+  settingsChunkAppend(F("'><input id='demo_voltage' name='demo_voltage' type='number' step='0.1' value='"));
+  settingsChunkAppend(String(demoBatteryVoltage, 1));
+  settingsChunkAppend(F("'><label for='demo_current'>Battery A</label><label for='demo_ah'>Used Ah</label><input id='demo_current' name='demo_current' type='number' step='0.1' value='"));
+  settingsChunkAppend(String(demoBatteryCurrent, 1));
+  settingsChunkAppend(F("'><input id='demo_ah' name='demo_ah' type='number' step='0.1' value='"));
+  settingsChunkAppend(String(demoBatteryConsumedAh, 1));
+  settingsChunkAppend(F("'><label for='demo_pv'>Solar W</label><label for='demo_solar_v'>Solar battery V</label><input id='demo_pv' name='demo_pv' type='number' step='1' value='"));
+  settingsChunkAppend(String(demoSolarPvPower, 0));
+  settingsChunkAppend(F("'><input id='demo_solar_v' name='demo_solar_v' type='number' step='0.1' value='"));
+  settingsChunkAppend(String(demoSolarBatteryVoltage, 1));
+  settingsChunkAppend(F("'><label for='demo_solar_a'>Solar charge A</label><label for='demo_yield'>Solar yield kWh</label><input id='demo_solar_a' name='demo_solar_a' type='number' step='0.1' value='"));
+  settingsChunkAppend(String(demoSolarChargeCurrent, 1));
+  settingsChunkAppend(F("'><input id='demo_yield' name='demo_yield' type='number' step='0.01' value='"));
+  settingsChunkAppend(String(demoSolarYieldKwh, 2));
+  settingsChunkAppend(F("'></div>"));
+  settingsChunkAppend(F("<button type='submit'>Save Settings</button></form>"));
+  settingsChunkAppend(F("<form method='post' action='/clear-keys' data-working='Clearing keys...'>"));
+  settingsChunkAppend(F("<button class='danger' type='submit'>Clear Saved Keys</button></form>"));
+  settingsChunkAppend(F("<h2>Premade ChargeScreen</h2>"));
+  settingsChunkAppend(F("<p class='hint'>Premade units with firmware already installed are available through the ChargeScreen project thread on the T6 Forum.</p>"));
+  settingsChunkAppend(F("<a href='https://www.t6forum.com/threads/standalone-esp32-ble-battery-display-for-victron-systems.66515/' style='display:block;box-sizing:border-box;width:100%;margin-top:18px;padding:14px;background:#2fb36d;color:#04140b;text-align:center;text-decoration:none;font-weight:700'>View T6 Forum thread</a>"));
+  settingsChunkAppend(F("<h2>BLE Capture</h2>"));
+  settingsChunkAppend(F("<p class='hint'>This records nearby Bluetooth Low Energy advertisements for 5 minutes so the data can be inspected later. During capture, the round screen changes to a capture display and normal dashboard decoding is paused. The CSV records timing, address, name, signal strength, manufacturer data, service data, advertised UUIDs, and raw advertisement payloads.</p>"));
+  settingsChunkAppend(F("<p class='hint'>Privacy note: this captures all BLE advertisements nearby, including packets from things like watches, phones, TVs, and sensors. Most of that data is encrypted or only useful to the device it belongs to, but the packets will still appear in the CSV. It is safe to share for debugging.</p>"));
+  settingsChunkAppend(F("<p class='hint'>Your battery data may also be encrypted. If the battery app shows Bluetooth encryption codes, include them with the email containing the capture. Those codes only help decode the battery packets; they do not give access to your WiFi, phone, or other devices. Realistically, the most they could reveal is your battery status if someone was physically nearby, for example on the same campsite.</p>"));
+  settingsChunkAppend(F("<p class='hint'>Send the completed CSV and any battery encryption codes to <a href='mailto:blecapture@chargescreen.co.uk' style='color:#8fe6ff'>blecapture@chargescreen.co.uk</a>. Captures are used to improve compatibility with more devices in future firmware.</p>"));
+  settingsChunkAppend(F("<p class='hint'>Use this with the device physically close to the battery or accessory you want to identify. The saved CSV is named after the strongest BLE signal heard during the capture.</p>"));
+  settingsChunkAppend(F("<div class='msg'><strong id='cap_state'>Capture status loading...</strong><br><span id='cap_detail' class='hint'></span></div>"));
   if (captureActive) {
-    html += F("<div class='msg'>Capture running. Watch the round screen or refresh this page for status.</div>");
-    html += F("<form method='post' action='/capture-stop' data-working='Saving capture...'><button type='submit'>Stop and Save Now</button></form>");
-    html += F("<form method='post' action='/capture-cancel' data-working='Cancelling capture...'><button class='secondary' type='submit'>Cancel Capture</button></form>");
+    settingsChunkAppend(F("<div class='msg'>Capture running. Watch the round screen or refresh this page for status.</div>"));
+    settingsChunkAppend(F("<form method='post' action='/capture-stop' data-working='Saving capture...'><button type='submit'>Stop and Save Now</button></form>"));
+    settingsChunkAppend(F("<form method='post' action='/capture-cancel' data-working='Cancelling capture...'><button class='secondary' type='submit'>Cancel Capture</button></form>"));
   } else {
-    html += F("<form method='post' action='/capture-start' data-working='Starting capture...'><button type='submit'>Start 5 Minute BLE Capture</button></form>");
+    settingsChunkAppend(F("<form method='post' action='/capture-start' data-working='Starting capture...'><button type='submit'>Start 5 Minute BLE Capture</button></form>"));
   }
   if (captureSaved && LittleFS.exists(capturePath)) {
-    html += F("<p class='hint'>BLE capture ready: ");
-    html += captureFilename;
-    html += F("</p><p class='hint'>After downloading, email the CSV file together with any Bluetooth encryption keys or codes shown in your battery app to <a href='mailto:blecapture@chargescreen.co.uk' style='color:#8fe6ff'>blecapture@chargescreen.co.uk</a>. This capture will be used to aid future development and improve compatibility with more devices. The keys are only used to decode battery packets in the capture.</p>");
-    html += F("<a href='/download-capture' style='display:block;box-sizing:border-box;width:100%;margin-top:18px;padding:14px;background:#2fb36d;color:#04140b;text-align:center;text-decoration:none;font-weight:700'>Download BLE CSV</a>");
+    settingsChunkAppend(F("<p class='hint'>BLE capture ready: "));
+    settingsChunkAppend(captureFilename);
+    settingsChunkAppend(F("</p><p class='hint'>After downloading, email the CSV file together with any Bluetooth encryption keys or codes shown in your battery app to <a href='mailto:blecapture@chargescreen.co.uk' style='color:#8fe6ff'>blecapture@chargescreen.co.uk</a>. This capture will be used to aid future development and improve compatibility with more devices. The keys are only used to decode battery packets in the capture.</p>"));
+    settingsChunkAppend(F("<a href='/download-capture' style='display:block;box-sizing:border-box;width:100%;margin-top:18px;padding:14px;background:#2fb36d;color:#04140b;text-align:center;text-decoration:none;font-weight:700'>Download BLE CSV</a>"));
   } else {
-    html += F("<p class='hint'>No BLE capture CSV is ready yet.</p>");
+    settingsChunkAppend(F("<p class='hint'>No BLE capture CSV is ready yet.</p>"));
   }
-  html += F("<form method='post' action='/firmware' enctype='multipart/form-data' data-working='Uploading firmware...'>");
-  html += F("<label for='firmware'>Firmware update</label><input id='firmware' name='firmware' type='file' accept='.bin,application/octet-stream'>");
-  html += F("<button class='secondary' type='submit'>Upload Firmware</button></form>");
-  html += F("<button class='secondary' type='button' onclick='location.reload()'>Refresh Status</button>");
-  html += F("<p class='hint'>Leave a key field blank to keep its current value. Firmware updates must be a valid ESP32-C3 firmware.bin built for this project. The hotspot turns off after 5 minutes with no page activity.</p>");
-  html += F("<script>for(const f of document.forms){f.addEventListener('submit',()=>{const s=document.getElementById('status');s.hidden=false;s.textContent=f.dataset.working||'Working...';for(const b of document.querySelectorAll('button'))b.disabled=true;});}");
-  html += F("function mmss(s){let m=Math.floor(s/60),r=s%60;return String(m).padStart(2,'0')+':'+String(r).padStart(2,'0')}");
-  html += F("async function cap(){try{let r=await fetch('/capture-status');let j=await r.json();cap_state.textContent=j.active?'Recording '+mmss(j.remaining_s):(j.saved?'Capture ready':'No capture running');cap_detail.textContent='Packets '+j.packets+', strongest '+(j.strongest||'-')+', RSSI '+(j.rssi>-127?j.rssi+' dBm':'-');}catch(e){}}setInterval(cap,1000);cap();</script>");
-  html += F("</main></body></html>");
-  return html;
+  settingsChunkAppend(F("<form method='post' action='/firmware' enctype='multipart/form-data' data-working='Uploading firmware...'>"));
+  settingsChunkAppend(F("<label for='firmware'>Firmware update</label><input id='firmware' name='firmware' type='file' accept='.bin,application/octet-stream'>"));
+  settingsChunkAppend(F("<button class='secondary' type='submit'>Upload Firmware</button></form>"));
+  settingsChunkAppend(F("<button class='secondary' type='button' onclick='location.reload()'>Refresh Status</button>"));
+  settingsChunkAppend(F("<p class='hint'>Leave a key field blank to keep its current value. Firmware updates must be a valid ESP32-C3 firmware.bin built for this project. The hotspot turns off after 5 minutes with no page activity.</p>"));
+  settingsChunkAppend(F("<script>for(const f of document.forms){f.addEventListener('submit',()=>{const s=document.getElementById('status');s.hidden=false;s.textContent=f.dataset.working||'Working...';for(const b of document.querySelectorAll('button'))b.disabled=true;});}"));
+  settingsChunkAppend(F("function mmss(s){let m=Math.floor(s/60),r=s%60;return String(m).padStart(2,'0')+':'+String(r).padStart(2,'0')}"));
+  settingsChunkAppend(F("async function cap(){try{let r=await fetch('/capture-status');let j=await r.json();cap_state.textContent=j.active?'Recording '+mmss(j.remaining_s):(j.saved?'Capture ready':'No capture running');cap_detail.textContent='Packets '+j.packets+', strongest '+(j.strongest||'-')+', RSSI '+(j.rssi>-127?j.rssi+' dBm':'-');}catch(e){}}setInterval(cap,3000);cap();</script>"));
+  settingsChunkAppend(F("</main></body></html>"));
 }
 
 static void noteSettingsServerActivity() {
@@ -1900,7 +1943,22 @@ static void noteSettingsServerActivity() {
 static void handleSettingsRoot() {
   noteSettingsServerActivity();
   settingsServer.sendHeader("Cache-Control", "no-store");
-  settingsServer.send(200, "text/html", settingsPageHtml(settingsStatusMessage(settingsServer.arg("status"))));
+  // Safety net: even with BLE paused, cap how long any single write can
+  // block. Without this, a stalled client connection could still freeze
+  // loop() indefinitely. 2000ms is generous for a page this size on a
+  // direct AP connection.
+  settingsServer.client().setTimeout(2000);
+  uint32_t handlerStartMs = millis();
+  // Content length unknown up front - this puts the WebServer into chunked
+  // transfer mode, so streamSettingsPageHtml() can push the page out piece
+  // by piece below instead of needing one big buffer ready in advance.
+  settingsServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  settingsServer.send(200, "text/html", "");
+  settingsChunkReset();
+  streamSettingsPageHtml(settingsStatusMessage(settingsServer.arg("status")));
+  settingsChunkFlush();
+  settingsServer.sendContent("");  // terminates the chunked response
+  Serial.printf("[settings] root response took %lums\n", (unsigned long)(millis() - handlerStartMs));
 }
 
 static void handleSettingsSave() {
@@ -2235,6 +2293,7 @@ static void handleCaptureDownload() {
 }
 
 static void handleCaptureStatus() {
+  noteSettingsServerActivity();
   settingsServer.sendHeader("Cache-Control", "no-store");
   settingsServer.send(200, "application/json", captureStatusJson());
 }
@@ -2265,10 +2324,22 @@ static void handleCaptureCancel() {
   drawCurrentPage(true);
 }
 
+static constexpr uint32_t SETTINGS_SERVER_RESTART_COOLDOWN_MS = 8000;
+
 static void startSettingsServer() {
   if (settingsServerActive) {
     noteSettingsServerActivity();
     settingsMessage = "WiFi already on";
+    drawCurrentPage(true);
+    return;
+  }
+
+  // Restarting the AP too soon after it just stopped was compounding heap
+  // fragmentation (we measured available headroom getting worse each rapid
+  // cycle) and at least once triggered a WiFi driver-level cleanup timeout.
+  // Give it a moment to settle before allowing another start.
+  if (lastSettingsServerStopMs != 0 && millis() - lastSettingsServerStopMs < SETTINGS_SERVER_RESTART_COOLDOWN_MS) {
+    settingsMessage = "WiFi settling, try again shortly";
     drawCurrentPage(true);
     return;
   }
@@ -2284,6 +2355,18 @@ static void startSettingsServer() {
     return;
   }
 
+  // The ESP32-C3 has a single 2.4GHz radio shared between WiFi and BLE.
+  // Serving the AP + HTTP portal while BLE is actively scanning makes both
+  // contend for the same radio time, and that contention was very likely
+  // what caused writes to the settings client to stall indefinitely (and
+  // freeze the whole loop(), including touch). Pause BLE scanning for the
+  // duration the portal is up; it resumes in stopSettingsServer().
+  Serial.println("[trace] before scan->stop()");
+  Serial.flush();
+  NimBLEDevice::getScan()->stop();
+  Serial.println("[trace] after scan->stop()");
+  Serial.println("BLE scan paused for settings portal");
+
   settingsServer.on("/", HTTP_GET, handleSettingsRoot);
   settingsServer.on("/save", HTTP_POST, handleSettingsSave);
   settingsServer.on("/clear-keys", HTTP_POST, handleSettingsClearKeys);
@@ -2295,14 +2378,16 @@ static void startSettingsServer() {
   settingsServer.on("/capture-cancel", HTTP_POST, handleCaptureCancel);
   settingsServer.onNotFound(handleSettingsRoot);
   captiveDnsServer.start(53, "*", WiFi.softAPIP());
+  Serial.printf("Free heap before settings server begin: %u bytes, maxAlloc: %u bytes\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   settingsServer.begin();
   settingsServerActive = true;
+  Serial.printf("Free heap after settings server begin: %u bytes, maxAlloc: %u bytes\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   noteSettingsServerActivity();
   settingsMessage = String("Open ") + WiFi.softAPIP().toString();
   drawCurrentPage(true);
 }
 
-static void stopSettingsServer() {
+static void stopSettingsServer(const char *reason = "WiFi off") {
   if (!settingsServerActive) {
     return;
   }
@@ -2311,9 +2396,16 @@ static void stopSettingsServer() {
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);
   settingsServerActive = false;
-  settingsMessage = "WiFi off";
+  lastSettingsServerStopMs = millis();
+  settingsMessage = reason;
   invalidateScreens();
   drawCurrentPage(true);
+
+  // Resume BLE scanning now that the radio isn't needed for the AP/portal.
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  scan->start(0, false, false);
+  lastBleScanStartMs = millis();
+  Serial.println("BLE scan resumed after settings portal closed");
 }
 
 static void updateSettingsServer() {
@@ -2321,8 +2413,14 @@ static void updateSettingsServer() {
     return;
   }
 
+  Serial.println("[trace] before captiveDnsServer.processNextRequest");
+  Serial.flush();
   captiveDnsServer.processNextRequest();
+  Serial.println("[trace] after captiveDnsServer.processNextRequest / before handleClient");
+  Serial.flush();
   settingsServer.handleClient();
+  Serial.println("[trace] after handleClient");
+  Serial.flush();
   if (captureActive) {
     lastSettingsServerActivityMs = millis();
     return;
@@ -3167,6 +3265,30 @@ static void updateBleWatchdog() {
   }
   lastBleWatchdogMs = now;
 
+  Serial.printf("[heap] t=%lums free=%u maxAlloc=%u settingsServerActive=%d\n",
+                (unsigned long)now,
+                ESP.getFreeHeap(),
+                ESP.getMaxAllocHeap(),
+                settingsServerActive ? 1 : 0);
+
+  // We measured requests starting to fail to even allocate a read buffer
+  // once maxAlloc dropped to ~5100 bytes (causing ~10s stalls while the
+  // WebServer's request parser retried). 7000 bytes gives some margin to
+  // close the portal cleanly before hitting that failure mode.
+  static constexpr uint32_t SETTINGS_MAX_ALLOC_FLOOR = 7000;
+  if (settingsServerActive && ESP.getMaxAllocHeap() < SETTINGS_MAX_ALLOC_FLOOR) {
+    Serial.println("[heap] maxAlloc below safety floor while portal active; closing portal");
+    stopSettingsServer("WiFi off (low memory)");
+    return;
+  }
+
+  // Scan is deliberately paused while the settings portal is up (see
+  // startSettingsServer/stopSettingsServer) to avoid WiFi/BLE radio
+  // contention. Don't let the watchdog fight that by restarting it.
+  if (settingsServerActive) {
+    return;
+  }
+
   NimBLEScan *scan = NimBLEDevice::getScan();
   if (!scan->isScanning()) {
     Serial.println("BLE scan was stopped; restarting");
@@ -3337,10 +3459,40 @@ static void updateTouchSwipe() {
   }
 }
 
+// The accepted-connection sockets used by the settings portal's WebServer
+// never get a receive/send timeout applied by the underlying arduino-esp32
+// Network library (confirmed by reading NetworkServer::accept() - it only
+// sets SO_KEEPALIVE/TCP_NODELAY, not SO_RCVTIMEO/SO_SNDTIMEO, unlike
+// outbound connect()). That means a client that opens a connection to the
+// portal and then goes idle (iOS's automatic captive-portal probing does
+// exactly this) can block a raw socket read/write forever at the kernel
+// level, and nothing at the Arduino/library level above that can recover
+// from it - our own setTimeout() calls only affect a software counter,
+// not the actual socket. Since that can't be safely fixed from application
+// code without patching a system library, use the hardware watchdog as a
+// safety net: if loop() doesn't come back around within
+// TASK_WATCHDOG_TIMEOUT_S, force a clean reboot (with a backtrace showing
+// exactly where it was stuck) instead of staying frozen indefinitely.
+static constexpr uint32_t TASK_WATCHDOG_TIMEOUT_S = 10;
+
+static void initTaskWatchdog() {
+  // This project's pinned arduino-esp32 core ships an older esp_task_wdt.h
+  // that predates the esp_task_wdt_config_t/reconfigure API - only the
+  // simple (timeout_s, panic) signature is available here.
+  esp_err_t err = esp_task_wdt_init(TASK_WATCHDOG_TIMEOUT_S, true);
+  if (err != ESP_OK) {
+    Serial.printf("Task watchdog init failed, err=%d\n", (int)err);
+    return;
+  }
+  esp_task_wdt_add(NULL);  // watch the current (loop) task
+  Serial.printf("Task watchdog armed, timeout=%lus\n", (unsigned long)TASK_WATCHDOG_TIMEOUT_S);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
   loadStoredSecrets();
+  initTaskWatchdog();
 
   initBacklight();
   noteTouchActivity();
@@ -3351,6 +3503,7 @@ void setup() {
   if (!gfx->begin()) {
     Serial.println("Canvas init failed");
   }
+  Serial.printf("Free heap after canvas init: %u bytes, maxAlloc: %u bytes\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   // Only the physical panel rotates. Arduino_Canvas::flush() blits its framebuffer
   // to output_display unrotated, so rotating the Canvas itself would double-apply
@@ -3380,6 +3533,7 @@ void setup() {
 
 void loop() {
   static uint32_t lastDraw = 0;
+  esp_task_wdt_reset();
   updateSettingsServer();
   updateBleWatchdog();
   updateTouchSwipe();
@@ -3392,7 +3546,12 @@ void loop() {
   uint32_t drawIntervalMs = 1000;
   if (screenAwake && millis() - lastDraw > drawIntervalMs) {
     lastDraw = millis();
+    uint32_t drawStartMs = millis();
     drawCurrentPage();
+    uint32_t drawDurationMs = millis() - drawStartMs;
+    if (drawDurationMs > 20) {
+      Serial.printf("[draw] drawCurrentPage took %lums\n", (unsigned long)drawDurationMs);
+    }
   }
 
   delay(20);
